@@ -14,8 +14,8 @@ use rustc_macros::HashStable_Generic;
 use rustc_span::symbol::kw;
 use rustc_span::symbol::Symbol;
 use rustc_span::{self, Span, DUMMY_SP};
-use std::fmt;
-use std::mem;
+use std::borrow::Cow;
+use std::{fmt, mem};
 
 #[derive(Clone, PartialEq, RustcEncodable, RustcDecodable, Hash, Debug, Copy)]
 #[derive(HashStable_Generic)]
@@ -328,6 +328,18 @@ impl Token {
         mem::replace(self, Token::dummy())
     }
 
+    /// For interpolated tokens returns a span of the fragment to which the interpolated
+    /// token refers, for all other tokens this is just a regular span.
+    /// It is particularly important to use this for identifiers and lifetimes
+    /// for which spans affect name resolution. This also includes edition checks
+    /// for edition-specific keyword identifiers.
+    pub fn uninterpolated_span(&self) -> Span {
+        match &self.kind {
+            Interpolated(nt) => nt.span(),
+            _ => self.span,
+        }
+    }
+
     pub fn is_op(&self) -> bool {
         match self.kind {
             OpenDelim(..) | CloseDelim(..) | Literal(..) | DocComment(..) | Ident(..)
@@ -345,7 +357,7 @@ impl Token {
 
     /// Returns `true` if the token can appear at the start of an expression.
     pub fn can_begin_expr(&self) -> bool {
-        match self.kind {
+        match self.uninterpolate().kind {
             Ident(name, is_raw)              =>
                 ident_can_begin_expr(name, self.span, is_raw), // value name or keyword
             OpenDelim(..)                     | // tuple, array or block
@@ -363,12 +375,10 @@ impl Token {
             Lifetime(..)                      | // labeled loop
             Pound                             => true, // expression attributes
             Interpolated(ref nt) => match **nt {
-                NtIdent(ident, is_raw) => ident_can_begin_expr(ident.name, ident.span, is_raw),
                 NtLiteral(..) |
                 NtExpr(..)    |
                 NtBlock(..)   |
-                NtPath(..)    |
-                NtLifetime(..) => true,
+                NtPath(..) => true,
                 _ => false,
             },
             _ => false,
@@ -377,7 +387,7 @@ impl Token {
 
     /// Returns `true` if the token can appear at the start of a type.
     pub fn can_begin_type(&self) -> bool {
-        match self.kind {
+        match self.uninterpolate().kind {
             Ident(name, is_raw)        =>
                 ident_can_begin_type(name, self.span, is_raw), // type name or keyword
             OpenDelim(Paren)            | // tuple
@@ -391,8 +401,7 @@ impl Token {
             Lt | BinOp(Shl)             | // associated path
             ModSep                      => true, // global path
             Interpolated(ref nt) => match **nt {
-                NtIdent(ident, is_raw) => ident_can_begin_type(ident.name, ident.span, is_raw),
-                NtTy(..) | NtPath(..) | NtLifetime(..) => true,
+                NtTy(..) | NtPath(..) => true,
                 _ => false,
             },
             _ => false,
@@ -433,11 +442,10 @@ impl Token {
     ///
     /// Keep this in sync with `Lit::from_token`.
     pub fn can_begin_literal_or_bool(&self) -> bool {
-        match self.kind {
+        match self.uninterpolate().kind {
             Literal(..) | BinOp(Minus) => true,
             Ident(name, false) if name.is_bool_lit() => true,
             Interpolated(ref nt) => match &**nt {
-                NtIdent(ident, false) if ident.name.is_bool_lit() => true,
                 NtExpr(e) | NtLiteral(e) => matches!(e.kind, ast::ExprKind::Lit(_)),
                 _ => false,
             },
@@ -445,26 +453,36 @@ impl Token {
         }
     }
 
+    // Turns interpolated identifier (`$i: ident`) or lifetime (`$l: lifetime`) token
+    // into the regular identifier or lifetime token it refers to,
+    // otherwise returns the original token.
+    pub fn uninterpolate(&self) -> Cow<'_, Token> {
+        match &self.kind {
+            Interpolated(nt) => match **nt {
+                NtIdent(ident, is_raw) => {
+                    Cow::Owned(Token::new(Ident(ident.name, is_raw), ident.span))
+                }
+                NtLifetime(ident) => Cow::Owned(Token::new(Lifetime(ident.name), ident.span)),
+                _ => Cow::Borrowed(self),
+            },
+            _ => Cow::Borrowed(self),
+        }
+    }
+
     /// Returns an identifier if this token is an identifier.
     pub fn ident(&self) -> Option<(ast::Ident, /* is_raw */ bool)> {
-        match self.kind {
-            Ident(name, is_raw) => Some((ast::Ident::new(name, self.span), is_raw)),
-            Interpolated(ref nt) => match **nt {
-                NtIdent(ident, is_raw) => Some((ident, is_raw)),
-                _ => None,
-            },
+        let token = self.uninterpolate();
+        match token.kind {
+            Ident(name, is_raw) => Some((ast::Ident::new(name, token.span), is_raw)),
             _ => None,
         }
     }
 
     /// Returns a lifetime identifier if this token is a lifetime.
     pub fn lifetime(&self) -> Option<ast::Ident> {
-        match self.kind {
-            Lifetime(name) => Some(ast::Ident::new(name, self.span)),
-            Interpolated(ref nt) => match **nt {
-                NtLifetime(ident) => Some(ident),
-                _ => None,
-            },
+        let token = self.uninterpolate();
+        match token.kind {
+            Lifetime(name) => Some(ast::Ident::new(name, token.span)),
             _ => None,
         }
     }
@@ -713,6 +731,24 @@ pub enum Nonterminal {
 // `Nonterminal` is used a lot. Make sure it doesn't unintentionally get bigger.
 #[cfg(target_arch = "x86_64")]
 rustc_data_structures::static_assert_size!(Nonterminal, 40);
+
+impl Nonterminal {
+    fn span(&self) -> Span {
+        match self {
+            NtItem(item) => item.span,
+            NtBlock(block) => block.span,
+            NtStmt(stmt) => stmt.span,
+            NtPat(pat) => pat.span,
+            NtExpr(expr) | NtLiteral(expr) => expr.span,
+            NtTy(ty) => ty.span,
+            NtIdent(ident, _) | NtLifetime(ident) => ident.span,
+            NtMeta(attr_item) => attr_item.span(),
+            NtPath(path) => path.span,
+            NtVis(vis) => vis.span,
+            NtTT(tt) => tt.span(),
+        }
+    }
+}
 
 impl PartialEq for Nonterminal {
     fn eq(&self, rhs: &Self) -> bool {
